@@ -4,10 +4,12 @@
 The plugin main window class file.
 """
 import os
+import pathlib
+import typing
 
 import uuid
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # QGIS imports
 from qgis.PyQt import QtCore, QtGui, QtNetwork, QtWidgets
@@ -18,6 +20,7 @@ from qgis.core import (
     QgsEditorWidgetSetup,
     QgsField,
     QgsInterval,
+    QgsLayerTreeGroup,
     QgsProject,
     QgsTemporalNavigationObject,
     QgsUnitTypes,
@@ -35,8 +38,10 @@ from ..definitions.defaults import (
     SITE_GROUP_NAME,
     PLUGIN_ICON
 )
-
-from ..models.base import IMAGERY
+from ..gui.report_progress_dialog import ReportProgressDialog
+from ..lib.reports.manager import report_manager
+from ..models.base import IMAGERY, MapTemporalInfo
+from ..models.report import SiteMetadata
 
 from ..resources import *
 from ..utils import animation_state_change, clean_filename, create_dir, log, tr
@@ -80,6 +85,9 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         # Date when project captured started
         self.capture_date = None
 
+        # Last captured area of the site
+        self.last_computed_area = ""
+
         self.clear_btn.clicked.connect(self.cancel_drawing)
 
         self.restore_settings()
@@ -92,6 +100,7 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         self.project_inception_date.dateChanged.connect(self.save_settings)
         self.country_cmb_box.currentIndexChanged.connect(self.save_settings)
 
+        self.report_btn.clicked.connect(self.on_generate_report)
 
         self.navigation_object = QgsTemporalNavigationObject(self)
         self.navigation_object.setFrameDuration(
@@ -145,8 +154,8 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         )
         self.prepare_time_slider()
 
-        self.historical_imagery.toggled.connect(self.prepare_time_slider)
-        self.nicfi_imagery.toggled.connect(self.prepare_time_slider)
+        self.historical_imagery.toggled.connect(self.historical_imagery_toggled)
+        self.nicfi_imagery.toggled.connect(self.nicfi_imagery_toggled)
 
         self.play_btn.clicked.connect(self.animate_layers)
 
@@ -163,6 +172,8 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         self.drawing_layer = None
         self.drawing_layer_path = None
 
+        self.saved_layer = None
+
         self.feature_count = 0
 
         self.iface.projectRead.connect(self.prepare_time_slider)
@@ -170,6 +181,7 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
     def animation_loop_toggled(self, value):
         self.save_settings()
         self.navigation_object.setLooping(value)
+
     def frame_rate_changed(self, value):
         self.save_settings()
         self.navigation_object.setFramesPerSecond(
@@ -294,31 +306,41 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
             self.play_btn.setToolTip(tr("Pause animation"))
             self.play_btn.setIcon(QtGui.QIcon(ANIMATION_PAUSE_ICON))
 
-    def prepare_time_slider(self):
+    def historical_imagery_toggled(self):
+
+        if self.historical_imagery.isChecked():
+            settings_manager.set_value(Settings.HISTORICAL_VIEW, True)
+            settings_manager.set_value(Settings.NICFI_VIEW, False)
+            self.nicfi_imagery.setChecked(False)
+
+            self.current_imagery_type = IMAGERY.HISTORICAL
+            closed_imagery = IMAGERY.NICFI
+
+            self.prepare_time_slider(closed_imagery)
+        else:
+            settings_manager.set_value(Settings.HISTORICAL_VIEW, False)
+
+    def nicfi_imagery_toggled(self):
+        if self.nicfi_imagery.isChecked():
+            self.historical_imagery.setChecked(False)
+
+            settings_manager.set_value(Settings.NICFI_VIEW, True)
+            settings_manager.set_value(Settings.HISTORICAL_VIEW, False)
+
+            self.current_imagery_type = IMAGERY.NICFI
+            closed_imagery = IMAGERY.HISTORICAL
+            self.prepare_time_slider(closed_imagery)
+        else:
+            settings_manager.set_value(Settings.NICFI_VIEW, False)
+
+
+    def prepare_time_slider(self, closed_imagery=None):
         """
         Prepare the time slider based on current selected imagery type.
         """
         values = []
         set_layer = None
         active_layer = None
-
-        closed_imagery = None
-
-        if self.historical_imagery.isChecked():
-            settings_manager.set_value(Settings.HISTORICAL_VIEW, True)
-            settings_manager.set_value(Settings.NICFI_VIEW, False)
-
-            self.current_imagery_type = IMAGERY.HISTORICAL
-            closed_imagery = IMAGERY.NICFI
-        elif self.nicfi_imagery.isChecked():
-            settings_manager.set_value(Settings.NICFI_VIEW, True)
-            settings_manager.set_value(Settings.HISTORICAL_VIEW, False)
-
-            self.current_imagery_type = IMAGERY.NICFI
-            closed_imagery = IMAGERY.HISTORICAL
-        else:
-            settings_manager.set_value(Settings.HISTORICAL_VIEW, False)
-            settings_manager.set_value(Settings.NICFI_VIEW, False)
 
         layers = QgsProject.instance().mapLayers()
         for path, layer in layers.items():
@@ -408,17 +430,16 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
 
         self.capture_date = datetime.now().strftime('%d%m%y')
 
-        area_name = (f"{self.site_reference_le.text()}_"
-                        f"{QgsProject.instance().baseName()}_"
-                        f"{self.country_cmb_box.currentText()}_"
-                        f"{self.capture_date}")
+        area_name = self._get_area_name()
 
-        self.drawing_layer_path = f"{os.path.join(sites_path, clean_filename(area_name))}.shp"
+        unique_area_name = f"{area_name}_{str(uuid.uuid4())[:4]}"
+
+        self.drawing_layer_path = f"{os.path.join(sites_path, clean_filename(unique_area_name))}.shp"
 
         # Create a new layer with multipolygon geometry
         self.drawing_layer = QgsVectorLayer(
             f"MultiPolygon?crs={crs_id}",
-            f"{area_name}",
+            unique_area_name,
             "memory"
         )
 
@@ -451,15 +472,10 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         root = QgsProject.instance().layerTreeRoot()
 
         # Find or create the group
-        group = None
-        for layer_group in root.findGroups():
-            if layer_group.name().lower() == SITE_GROUP_NAME.lower():
-                group = layer_group
-                break
+        group = self.find_group_by_name(SITE_GROUP_NAME, root)
 
         if not group:
             group = root.addGroup(SITE_GROUP_NAME)
-
 
         # Add the layer to the group
         group.addLayer(self.drawing_layer)
@@ -498,6 +514,54 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
 
         self.iface.actionAddFeature().trigger()
 
+    def _get_area_name(self):
+        """Get the area name.
+
+        :returns: Returns the area name.
+        :rtype: str
+        """
+        area_name = (f"{self.site_reference_le.text()}_"
+                     f"{QgsProject.instance().baseName()}_"
+                     f"{self.country_cmb_box.currentText()}_"
+                     f"{self.capture_date}")
+        return area_name
+
+    def is_project_info_valid(self) -> bool:
+        """Validates user input.
+        :returns: Returns True if the input is valid, else False.
+        :rtype: bool
+        """
+
+        selected_date_time = self.project_inception_date.dateTime()
+
+        if selected_date_time is None:
+            self.show_message(
+                tr("Please add the project inception date before saving the project area"),
+                Qgis.Warning
+            )
+            return False
+        if self.site_reference_le.text() is None or self.site_reference_le.text().replace(' ', '') is '':
+            self.show_message(
+                tr("Please add the site reference before saving the project area"),
+                Qgis.Warning
+            )
+            return False
+        if self.report_author_le.text() is None or self.report_author_le.text().replace(' ', '') is '':
+            self.show_message(
+                tr("Please add the report generation author before saving the project area"),
+                Qgis.Warning
+            )
+            return False
+        if self.site_ref_version_le.text() is None or self.site_ref_version_le.text().replace(' ', '') is '':
+            self.show_message(
+                tr("Please add the site reference version before saving the project area"),
+                Qgis.Warning
+            )
+            return False
+
+        return True
+
+
     def layer_feature_added(self, id):
         self.feature_count += 1
         if self.feature_count > 1:
@@ -516,6 +580,21 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
     def layer_editing_stopped(self):
         self.feature_count = 0
 
+    def find_group_by_name(self, group_name, root_group=None):
+        if root_group is None:
+            root_group = QgsProject.instance().layerTreeRoot()
+
+        if root_group.name() == group_name:
+            return root_group
+
+        for child in root_group.children():
+            if isinstance(child, QgsLayerTreeGroup):
+                result = self.find_group_by_name(group_name, child)
+                if result is not None:
+                    return result
+
+        return None
+
     # Disable editing for specific fields
     def update_field_editing(self, layer, field_names, enabled):
         setup = 'TextEdit' if enabled else 'Hidden'
@@ -527,32 +606,17 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
 
     def save_area(self):
 
-        selected_date_time = self.project_inception_date.dateTime()
+        if self.drawing_layer is None:
+            self.show_message(
+                tr("Please add the project area layer before saving the project area"),
+                Qgis.Warning
+            )
+            return
 
-        if selected_date_time is None:
-            self.show_message(
-                tr("Please add the project inception date before saving the project area"),
-                Qgis.Warning
-            )
+        if not self.is_project_info_valid():
             return
-        if self.site_reference_le.text() is None or self.site_reference_le.text().replace(' ', '') is '':
-            self.show_message(
-                tr("Please add the site reference before saving the project area"),
-                Qgis.Warning
-            )
-            return
-        if self.report_author_le.text() is None or self.report_author_le.text().replace(' ', '') is '':
-            self.show_message(
-                tr("Please add the report generation author before saving the project area"),
-                Qgis.Warning
-            )
-            return
-        if self.site_ref_version_le.text() is None or self.site_ref_version_le.text().replace(' ', '') is '':
-            self.show_message(
-                tr("Please add the site reference version before saving the project area"),
-                Qgis.Warning
-            )
-            return
+
+        selected_date_time = self.project_inception_date.dateTime()
 
         # List of fields to enable editing on
         fields_to_enable = [
@@ -571,13 +635,14 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         features = self.drawing_layer.getFeatures()
         first_feature = next(features, None)  # Retrieve the first feature
 
-
         if first_feature:
             feature_area = None
             geom = first_feature.geometry()
             if geom is not None and geom.isGeosValid():
                 area = geom.area() / 10000
                 feature_area = f"{area:,.2f}"
+                self.last_computed_area = feature_area
+
             # Set attribute values
             first_feature.setAttribute("site_ref", self.site_reference_le.text())
             first_feature.setAttribute("version", self.site_ref_version_le.text())
@@ -596,11 +661,43 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
             options.driverName = "ESRI Shapefile"
             options.fileEncoding = "UTF-8"
 
+            area_name = f"{self._get_area_name()}_{str(uuid.uuid4())[:4]}"
+
+            folder_path = self.project_folder.filePath()
+            sites_path = os.path.join(folder_path, 'sites')
+
+            layer_path = f"{os.path.join(sites_path, clean_filename(area_name))}.shp"
+
             error, error_message = QgsVectorFileWriter.writeAsVectorFormatV2(
-                self.drawing_layer, self.drawing_layer_path, transform_context, options
+                self.drawing_layer, layer_path, transform_context, options
             )
             if error == QgsVectorFileWriter.NoError:
-                self.drawing_layer.setReadOnly(True)
+                saved_layer = QgsVectorLayer(
+                    layer_path,
+                    area_name,
+                    "ogr"
+                )
+
+                if not saved_layer.isValid():
+                    self.show_message(
+                        tr("Problem saving the project area layer."),
+                        Qgis.Critical
+                    )
+
+                # Activate the drawing layer in order to direct add the saved layer
+                # into the same group
+                self.iface.setActiveLayer(self.drawing_layer)
+
+                QgsProject.instance().addMapLayers([saved_layer])
+
+                QgsProject.instance().removeMapLayer(
+                    self.drawing_layer
+                )
+
+                self.saved_layer = saved_layer
+                saved_layer.setReadOnly(True)
+
+                self.iface.mapCanvas().refresh()
                 self.show_message(
                     tr(f"Successfully saved the project area polygon to {self.drawing_layer_path}."),
                     Qgis.Info
@@ -617,23 +714,29 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         self.project_inception_date.clear()
         self.country_cmb_box.setCurrentIndex(-1)
 
-        if self.drawing_layer:
-            self.drawing_layer.commitChanges()
-            QgsProject.instance().removeMapLayer(self.drawing_layer)
-            self.iface.mapCanvas().refresh()
+        try:
+            if self.drawing_layer:
+                self.drawing_layer.commitChanges()
+                QgsProject.instance().removeMapLayer(self.drawing_layer)
+                self.iface.mapCanvas().refresh()
 
+                self.show_message(
+                    tr("Cleared the project input fields and area successfully."),
+                    Qgis.Info
+                )
+
+                self.drawing_layer = None
+            else:
+                self.show_message(
+                    tr("Cleared the project input fields."),
+                    Qgis.Info
+                )
+        except RuntimeError as e:
             self.show_message(
                 tr("Cleared the project input fields and area successfully."),
                 Qgis.Info
             )
-
-            self.drawing_layer = None
-        else:
-            self.show_message(
-                tr("Cleared the project input fields."),
-                Qgis.Info
-            )
-
+            log(f"Encountered an error when clearing the project drawn area.")
 
     def show_message(self, message, level=Qgis.Warning):
         """Shows message on the main widget message bar.
@@ -647,7 +750,6 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
         self.message_bar.clearWidgets()
         self.message_bar.pushMessage(message, level=level)
 
-
     def prepare_message_bar(self):
         """Initializes the widget message bar settings"""
         self.message_bar.setSizePolicy(
@@ -657,5 +759,143 @@ class QgisGeaPlugin(QtWidgets.QDockWidget, WidgetUi):
             self.message_bar, 0, 0, 1, 1, alignment=QtCore.Qt.AlignTop
         )
         self.dock_widget_contents.layout().insertLayout(0, self.grid_layout)
+
+    def get_latest_site_layer(self) -> typing.Optional[QgsVectorLayer]:
+        """Gets the latest saved layer in the 'sites' folder.
+
+        Caller needs to check validity of the layer.
+
+        :returns: Returns the latest saved layer in the
+        'sites' folder.
+        :rtype: QgsVectorLayer
+        """
+        if self.saved_layer:
+            return self.saved_layer
+
+        sites_dir = os.path.join(self.project_folder.filePath(), 'sites')
+        if not os.path.exists(sites_dir):
+            log(message="Sites directory does not exist.", info=False)
+            return None
+
+        matching_paths = []
+        iteration_control = 50
+        counter = 0
+        save_date = datetime.now()
+        while True:
+            if counter == iteration_control:
+                break
+
+            pattern = f"*{save_date.strftime('%d%m%y')}.shp"
+            paths = list(pathlib.Path(sites_dir).glob(pattern))
+            if len(paths) > 0:
+                matching_paths = list(paths)
+                break
+
+            save_date = save_date - timedelta(days=1)
+            counter += 1
+
+        if len(matching_paths) == 0:
+            log(message="Project area not found in sites directory.", info=False)
+            return None
+
+        layer_path = matching_paths[0]
+
+        return QgsVectorLayer(
+            str(layer_path),
+            layer_path.stem,
+            "ogr"
+        )
+
+    def on_generate_report(self):
+        """Slot raised to initiate the generation of a site report."""
+        if not self.is_project_info_valid():
+            return
+
+        # Get last saved layer
+        site_layer = self.get_latest_site_layer()
+        if site_layer is None:
+            tr_msg = tr("Unable to retrieve the saved project area.")
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("Generate Report"),
+                tr_msg
+            )
+            log(message=tr_msg, info=False)
+            return
+
+        if not site_layer.isValid():
+            tr_msg = tr("The last saved project area is invalid.")
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("Generate Report"),
+                tr_msg
+            )
+            log(message=tr_msg, info=False)
+            return
+
+        features = list(site_layer.getFeatures())
+        if len(features) == 0:
+            tr_msg = tr("The saved project area is empty.")
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("Generate Report"),
+                tr_msg
+            )
+            log(message=tr_msg, info=False)
+            return
+
+        # Get capture date and area
+        feature = features[0]
+
+        # If shapefile, some attribute names are truncated
+        capture_date = feature["capture_da"]
+        area = feature["area (ha)"]
+
+        if self.capture_date is None:
+            self.capture_date = capture_date
+
+        metadata = SiteMetadata(
+            self.country_cmb_box.currentText(),
+            self.project_inception_date.dateTime().toString("MMyy"),
+            self.report_author_le.text(),
+            self.site_reference_le.text(),
+            self.site_ref_version_le.text(),
+            self._get_area_name(),
+            capture_date,
+            area
+        )
+
+        if not self.historical_imagery.isChecked() and not self.nicfi_imagery.isChecked():
+            self.show_message(
+                tr("Please select the imagery type under the Time Slider section."),
+                Qgis.Warning
+            )
+            return
+
+        if self.historical_imagery.isChecked():
+            imagery_type = IMAGERY.HISTORICAL
+        else:
+            imagery_type = IMAGERY.NICFI
+
+        temporal_info = MapTemporalInfo(
+            imagery_type,
+            self.iface.mapCanvas().temporalRange()
+        )
+
+        submit_result = report_manager.generate_site_report(
+            metadata,
+            self.project_folder.filePath(),
+            temporal_info
+        )
+        if not submit_result.success:
+            self.message_bar.pushWarning(
+                tr("Site Report Error"),
+                tr("Unable to submit request for report. See logs for more details.")
+            )
+            return
+
+        self.report_progress_dialog = ReportProgressDialog(submit_result)
+        self.report_progress_dialog.setModal(False)
+        self.report_progress_dialog.show()
 
 
